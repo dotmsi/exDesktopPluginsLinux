@@ -1,2 +1,3 @@
 # exDesktopPluginsLinux
-exDesktop plugins ported for Linux
+Recommended: Arch Linux
+Recommended DE: KDE 6
