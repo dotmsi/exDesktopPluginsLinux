@@ -2588,6 +2588,9 @@ class Pet(QWidget):
         self.topmost = True
         self.geometry_key = None
         self.pending = []
+        self.hit = (0, 0, 0, 0)
+        self.origin = (0, 0)
+        self.press_ok = False
         self.crop = None
         self.canvas = None
         self.mode = None
@@ -2597,7 +2600,7 @@ class Pet(QWidget):
         self.menu = None
         self.box = None
 
-    def apply(self, x, y, w, h, mx, my, mw, mh, acked, data):
+    def apply(self, x, y, w, h, mx, my, mw, mh, acked, hx, hy, hw, hh, data):
         # `data` is only the drawn region (mx, my, mw, mh) of the w*h canvas.
         mx = max(0, min(mx, w - 1))
         my = max(0, min(my, h - 1))
@@ -2610,6 +2613,7 @@ class Pet(QWidget):
             x += dx
             y += dy
         region = QImage(data, mw, mh, mw * 4, QImage.Format.Format_RGBA8888)
+        self.hit = (max(0, hx), max(0, hy), max(1, hw), max(1, hh))
         if self.shape.available:
             self._apply_fixed(x, y, w, h, mx, my, mw, mh, region)
         else:
@@ -2617,8 +2621,8 @@ class Pet(QWidget):
         if self.want_visible and not self.isVisible():
             self.show()
             self.shape_rect = None
-        if self.mode == "fixed" and self.shape_rect != (mx, my, mw, mh):
-            self.shape_rect = (mx, my, mw, mh)
+        if self.mode == "fixed" and self.shape_rect != self.hit:
+            self.shape_rect = self.hit
             self.shape.set(int(self.winId()), self.shape_rect)
         self.update()
 
@@ -2642,6 +2646,7 @@ class Pet(QWidget):
             self.shape_rect = None
             self.setFixedSize(w, h)
         self.image = self._compose(w, h, region, mx, my)
+        self.origin = (0, 0)
         key = (x, y, w, h)
         if key != self.geometry_key:
             self.geometry_key = key
@@ -2672,10 +2677,28 @@ class Pet(QWidget):
         rx, ry = cur[0], cur[1]
         rw, rh = cur[2] - cur[0], cur[3] - cur[1]
         self.image = self._compose(rw, rh, region, mx - rx, my - ry)
+        self.origin = (rx, ry)
         key = (x + rx, y + ry, rw, rh)
         if key != self.geometry_key:
             self.geometry_key = key
             self.setGeometry(key[0], key[1], key[2], key[3])
+
+    def hit_test(self, pos):
+        """True only on / right next to drawn pixels of the pet itself."""
+        hx, hy, hw, hh = self.hit
+        cx = pos.x() + self.origin[0]
+        cy = pos.y() + self.origin[1]
+        if not (hx <= cx < hx + hw and hy <= cy < hy + hh):
+            return False
+        image = self.image
+        if image is None:
+            return False
+        radius = 5
+        for yy in range(max(0, pos.y() - radius), min(image.height(), pos.y() + radius + 1), 2):
+            for xx in range(max(0, pos.x() - radius), min(image.width(), pos.x() + radius + 1), 2):
+                if (image.pixel(xx, yy) >> 24) & 0xFF > 40:
+                    return True
+        return False
 
     def shift(self, seq, dx, dy):
         self.pending.append((seq, dx, dy))
@@ -2720,22 +2743,29 @@ class Pet(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            send(b"D", self._pos(event))
+            self.press_ok = self.hit_test(event.position().toPoint())
+            if self.press_ok:
+                send(b"D", self._pos(event))
 
     def mouseDoubleClickEvent(self, event):
         # Qt turns the second press of a double click into this event.
         if event.button() == Qt.MouseButton.LeftButton:
-            send(b"D", self._pos(event))
+            self.press_ok = self.hit_test(event.position().toPoint())
+            if self.press_ok:
+                send(b"D", self._pos(event))
 
     def mouseMoveEvent(self, event):
-        if event.buttons() & Qt.MouseButton.LeftButton:
+        if self.press_ok and event.buttons() & Qt.MouseButton.LeftButton:
             send(b"M", self._pos(event))
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            send(b"U", self._pos(event))
+            if self.press_ok:
+                self.press_ok = False
+                send(b"U", self._pos(event))
         elif event.button() == Qt.MouseButton.RightButton:
-            send(b"R", self._pos(event))
+            if self.hit_test(event.position().toPoint()):
+                send(b"R", self._pos(event))
 
     def show_menu(self, items, x, y):
         menu = QMenu()
@@ -2825,8 +2855,8 @@ def main():
 
     def handle(kind, body):
         if kind == b"F":
-            head = struct.unpack("<9i", body[:36])
-            pet.apply(*head, body[36:])
+            head = struct.unpack("<13i", body[:52])
+            pet.apply(*head, body[52:])
         elif kind == b"V":
             pet.set_visible(body[:1] == b"\x01")
         elif kind == b"T":
@@ -3258,11 +3288,13 @@ class ClawdWindowLinux(ClawdWindow):
         top = max(0, top)
         right = min(self._canvas_w, right)
         bottom = min(self._canvas_h, bottom)
+        hit_y = self._cy + self._hop_draw_offset()
         head = struct.pack(
-            "<9i", int(self._win_x), int(self._win_y),
+            "<13i", int(self._win_x), int(self._win_y),
             int(self._canvas_w), int(self._canvas_h),
             int(left), int(top), int(right - left), int(bottom - top),
-            int(self._g_seq))
+            int(self._g_seq),
+            int(self._cx), int(hit_y), int(self._pet_w), int(self._pet_h))
         region = img.crop((left, top, right, bottom)).tobytes()
         self._send(b"F", head + region)
 
