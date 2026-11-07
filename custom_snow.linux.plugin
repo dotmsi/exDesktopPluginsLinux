@@ -1,0 +1,1746 @@
+"""Custom Snow — ПК-адаптация для exDesktop.
+
+Оригинал встраивал скомпилированный classes.dex, рисующий снег поверх интерфейса
+телефона. В exDesktop нет Java/DEX, поэтому порт рисует те же частицы
+собственным окном поверх окна Telegram (Win32 layered window + Pillow в Windows,
+отдельный процесс на PyQt6 в Linux/KDE):
+  снежинки, сакура, матрица, дождик и осенний листопад,
+количество, прозрачность, скорость падения и вращения — как в оригинале.
+"""
+
+import ctypes
+import json
+import math
+import os
+import random
+import shutil
+import struct
+import subprocess
+import threading
+import time
+
+try:
+    from ctypes import wintypes
+except Exception:  # не-Windows
+    wintypes = None
+
+from base_plugin import BasePlugin
+from file_utils import ensure_dir_exists, get_plugins_dir
+from ui.settings import Divider, Header, Selector, Switch, Text
+
+__id__ = "custom_snow"
+__name__ = "Custom Snow"
+__description__ = ("Customize Telegram snow particles with sakura, matrix, rain, and autumn leaves. "
+                   "Windows and Linux (KDE Plasma).")
+__author__ = "@mraniv & @anivplugins · ПК-адаптация: @FLYXSE · Linux (KDE)-адаптация: @dotmashup"
+__version__ = "1.0.1"
+__icon__ = "LittleGirl56/9"
+__app_version__ = ">=7.0.0"
+__sdk_version__ = ">=1.4.0"
+__category__ = ["appearance"]
+
+IS_WINDOWS = os.name == "nt"
+IS_LINUX = os.name == "posix" and os.uname().sysname == "Linux"
+
+MODE_NAMES = (
+    "Снежинки", "Сакура", "Матрица", "Дождик", "Осенний листопад",
+)
+MODE_NAMES_EN = (
+    "Snowflakes", "Sakura", "Matrix", "Rain", "Autumn Leaves",
+)
+PARTICLE_COUNTS = list(range(20, 321, 20))          # 20..300 шаг 20 (индекс 4 = 100)
+OPACITY_VALUES = list(range(10, 101, 10))           # 10..100 % (индекс 9 = 100)
+SPEED_VALUES = tuple("%.1f" % (0.2 + 0.2 * i) for i in range(15))  # 0.2..3.0 (индекс 8 = 1.0)
+
+SIZE_VALUES = ("0.5", "0.75", "1.0", "1.5", "2.0", "2.5", "3.0", "4.0")      # index 2 = 1.0
+SPEED_DEFAULT = 4 if IS_LINUX else 8                  # SPEED_VALUES[4] == 1.0
+MATRIX_GLYPHS = "アイウエオカキクケコ0123456789ABCDEF"
+
+FX = 0
+SAKURA = 1
+MATRIX = 2
+RAIN = 3
+LEAF = 4
+
+
+def tr(ru, en):
+    try:
+        import ctypes as _ctypes
+
+        lang = int(_ctypes.windll.kernel32.GetUserDefaultUILanguage())
+        if (lang & 0x3FF) in (0x19, 0x42, 0x23):  # ru, uk, be
+            return ru
+    except Exception:
+        pass
+    try:
+        import locale
+
+        name = (locale.getlocale()[0] or os.environ.get("LC_ALL")
+                or os.environ.get("LANG") or "").lower()
+        if name.startswith(("ru", "uk", "be")):
+            return ru
+    except Exception:
+        pass
+    return en
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def parse_float(value, default):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+if IS_WINDOWS:
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    LRESULT = ctypes.c_ssize_t
+    WNDPROC = ctypes.WINFUNCTYPE(
+        LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
+    )
+    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    WS_POPUP = 0x80000000
+    WS_EX_LAYERED = 0x00080000
+    WS_EX_TRANSPARENT = 0x00000020
+    WS_EX_TOOLWINDOW = 0x00000080
+    WS_EX_TOPMOST = 0x00000008
+    WS_EX_NOACTIVATE = 0x08000000
+    GWL_EXSTYLE = -20
+    DWMWA_EXTENDED_FRAME_BOUNDS = 9
+    ULW_ALPHA = 0x00000002
+    AC_SRC_OVER = 0
+    AC_SRC_ALPHA = 1
+    SW_SHOWNOACTIVATE = 4
+    SW_HIDE = 0
+    SWP_NOSIZE = 0x0001
+    SWP_NOMOVE = 0x0002
+    SWP_NOACTIVATE = 0x0010
+    SWP_NOOWNERZORDER = 0x0200
+    WM_MOUSEACTIVATE = 0x0021
+    MA_NOACTIVATE = 3
+    WM_CLOSE = 0x0010
+    WM_DESTROY = 0x0002
+    WM_QUIT = 0x0012
+    IDC_ARROW = 32512
+    DIB_RGB_COLORS = 0
+    BI_RGB = 0
+
+    class WNDCLASSEXW(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.UINT),
+            ("style", wintypes.UINT),
+            ("lpfnWndProc", WNDPROC),
+            ("cbClsExtra", ctypes.c_int),
+            ("cbWndExtra", ctypes.c_int),
+            ("hInstance", wintypes.HINSTANCE),
+            ("hIcon", wintypes.HICON),
+            ("hCursor", wintypes.HANDLE),
+            ("hbrBackground", wintypes.HBRUSH),
+            ("lpszMenuName", wintypes.LPCWSTR),
+            ("lpszClassName", wintypes.LPCWSTR),
+            ("hIconSm", wintypes.HICON),
+        ]
+
+    class BLENDFUNCTION(ctypes.Structure):
+        _fields_ = [
+            ("BlendOp", ctypes.c_ubyte),
+            ("BlendFlags", ctypes.c_ubyte),
+            ("SourceConstantAlpha", ctypes.c_ubyte),
+            ("AlphaFormat", ctypes.c_ubyte),
+        ]
+
+    class BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [
+            ("biSize", wintypes.DWORD),
+            ("biWidth", wintypes.LONG),
+            ("biHeight", wintypes.LONG),
+            ("biPlanes", wintypes.WORD),
+            ("biBitCount", wintypes.WORD),
+            ("biCompression", wintypes.DWORD),
+            ("biSizeImage", wintypes.DWORD),
+            ("biXPelsPerMeter", wintypes.LONG),
+            ("biYPelsPerMeter", wintypes.LONG),
+            ("biClrUsed", wintypes.DWORD),
+            ("biClrImportant", wintypes.DWORD),
+        ]
+
+    class BITMAPINFO(ctypes.Structure):
+        _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", wintypes.DWORD * 1)]
+
+    def _setup_win32():
+        user32.RegisterClassExW.argtypes = [ctypes.POINTER(WNDCLASSEXW)]
+        user32.RegisterClassExW.restype = wintypes.ATOM
+        user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
+        user32.CreateWindowExW.argtypes = [
+            wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID,
+        ]
+        user32.CreateWindowExW.restype = wintypes.HWND
+        user32.DefWindowProcW.argtypes = [
+            wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
+        ]
+        user32.DefWindowProcW.restype = LRESULT
+        user32.DestroyWindow.argtypes = [wintypes.HWND]
+        user32.DestroyWindow.restype = wintypes.BOOL
+        user32.PeekMessageW.argtypes = [
+            ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+            wintypes.UINT, wintypes.UINT, wintypes.UINT,
+        ]
+        user32.PeekMessageW.restype = wintypes.BOOL
+        user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        user32.DispatchMessageW.restype = LRESULT
+        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.SetWindowPos.argtypes = [
+            wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, wintypes.UINT,
+        ]
+        user32.SetWindowPos.restype = wintypes.BOOL
+        user32.GetDC.argtypes = [wintypes.HWND]
+        user32.GetDC.restype = wintypes.HDC
+        user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+        user32.LoadCursorW.argtypes = [wintypes.HINSTANCE, ctypes.c_void_p]
+        user32.LoadCursorW.restype = wintypes.HANDLE
+        user32.UpdateLayeredWindow.argtypes = [
+            wintypes.HWND, wintypes.HDC, ctypes.POINTER(wintypes.POINT),
+            ctypes.POINTER(wintypes.SIZE), wintypes.HDC, ctypes.POINTER(wintypes.POINT),
+            wintypes.DWORD, ctypes.POINTER(BLENDFUNCTION), wintypes.DWORD,
+        ]
+        user32.UpdateLayeredWindow.restype = wintypes.BOOL
+        user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+        user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+        user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+        user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
+        user32.EnumWindows.restype = wintypes.BOOL
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND,
+                                                    ctypes.POINTER(wintypes.DWORD)]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.IsWindow.argtypes = [wintypes.HWND]
+        user32.IsWindow.restype = wintypes.BOOL
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.IsIconic.argtypes = [wintypes.HWND]
+        user32.IsIconic.restype = wintypes.BOOL
+        user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        user32.GetWindowRect.restype = wintypes.BOOL
+        gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+        gdi32.CreateCompatibleDC.restype = wintypes.HDC
+        gdi32.CreateDIBSection.argtypes = [
+            wintypes.HDC, ctypes.POINTER(BITMAPINFO), wintypes.UINT,
+            ctypes.POINTER(ctypes.c_void_p), wintypes.HANDLE, wintypes.DWORD,
+        ]
+        gdi32.CreateDIBSection.restype = wintypes.HBITMAP
+        gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HANDLE]
+        gdi32.SelectObject.restype = wintypes.HANDLE
+        gdi32.DeleteObject.argtypes = [wintypes.HANDLE]
+        gdi32.DeleteDC.argtypes = [wintypes.HDC]
+        kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        kernel32.GetModuleHandleW.restype = wintypes.HINSTANCE
+        kernel32.GetCurrentProcessId.argtypes = []
+        kernel32.GetCurrentProcessId.restype = wintypes.DWORD
+        try:
+            user32.GetDpiForWindow.argtypes = [wintypes.HWND]
+            user32.GetDpiForWindow.restype = wintypes.UINT
+        except Exception:
+            pass
+
+    _setup_win32()
+
+    _DWM = None
+
+    def _visible_window_rect(hwnd):
+        global _DWM
+        if not hwnd:
+            return None
+        if _DWM is None:
+            try:
+                dwm = ctypes.WinDLL("dwmapi", use_last_error=True)
+                dwm.DwmGetWindowAttribute.argtypes = [
+                    wintypes.HWND, wintypes.DWORD,
+                    ctypes.POINTER(wintypes.RECT), wintypes.DWORD,
+                ]
+                dwm.DwmGetWindowAttribute.restype = ctypes.c_long
+                _DWM = dwm
+            except Exception:
+                _DWM = False
+        if _DWM:
+            rect = wintypes.RECT()
+            try:
+                result = _DWM.DwmGetWindowAttribute(
+                    hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,
+                    ctypes.byref(rect), ctypes.sizeof(rect))
+                if result == 0 and rect.right > rect.left and rect.bottom > rect.top:
+                    return rect
+            except Exception:
+                pass
+        rect = wintypes.RECT()
+        if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return rect
+        return None
+
+
+def _load_font(size, bold=False):
+    from PIL import ImageFont
+
+    names = ("seguisym.ttf", "segoeui.ttf", "arial.ttf") if not bold else (
+        "segoeuib.ttf", "arialbd.ttf")
+    for name in names:
+        try:
+            return ImageFont.truetype(name, size)
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default(size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+class SnowOverlay:
+    """Прозрачное слоистое окно поверх exDesktop, рисующее частицы."""
+
+    def __init__(self, host):
+        self.host = host
+        self._class_name = "CustomSnow_%x" % id(self)
+        self._commands = []
+        self._command_lock = threading.Lock()
+        self._thread = None
+        self._stop = False
+        self._hwnd = None
+        self._tg_hwnd = None
+        self._tg_rect = None
+        self._tg_rect_at = 0.0
+        self._wndproc = WNDPROC(self._on_message) if IS_WINDOWS else None
+        self._class_atom = None
+
+        self._lock = threading.RLock()
+        self.cfg = {
+            "enabled": True,
+            "mode": SAKURA,
+            "count": 100,
+            "opacity": 100,
+            "speed": 1.0,
+            "rot": 1.0,
+        }
+
+        self._scale = 1.0
+        self._win_x = -10000
+        self._win_y = -10000
+        self._w = 1
+        self._h = 1
+        self._visible = False
+        self._frame = None
+        self._dib = None
+        self._dc = None
+        self._bits = None
+        self._transparent_ever = False
+        self._last_bounds = 0.0
+        self._next_frame = 0.0
+        self._particles = []
+        self._rng = random.Random(20240101)
+
+    # ---------------------------------------------------------------- API
+
+    def start(self):
+        if not IS_WINDOWS:
+            self.host.logger.warning("Custom Snow is Windows-only")
+            return
+        if self._thread is not None:
+            return
+        self._stop = False
+        self._thread = threading.Thread(target=self._run, name="custom-snow",
+                                        daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        if self._thread is None:
+            return
+        self.command("stop")
+        self._thread.join(timeout=3.0)
+        self._thread = None
+
+    def command(self, name, data=None):
+        with self._command_lock:
+            self._commands.append((name, data or {}))
+
+    def set_config(self, config):
+        with self._command_lock:
+            self._commands.append(("config", dict(config)))
+
+    # -------------------------------------------------------------- worker
+
+    def _run(self):
+        try:
+            self._create_window()
+            while not self._stop:
+                while True:
+                    msg = wintypes.MSG()
+                    if not user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
+                        break
+                    if msg.message == WM_QUIT:
+                        self._stop = True
+                        break
+                    user32.TranslateMessage(ctypes.byref(msg))
+                    user32.DispatchMessageW(ctypes.byref(msg))
+                if self._stop or self._hwnd is None:
+                    break
+                self._drain_commands()
+                try:
+                    self._sync_bounds()
+                    now = time.monotonic()
+                    if now >= self._next_frame:
+                        self._next_frame = now + 1.0 / 60.0
+                        self._render(now)
+                        self._blit()
+                except Exception:
+                    self.host.logger.exception("custom snow frame failed")
+                time.sleep(0.004)
+        except Exception:
+            self.host.logger.exception("custom snow thread failed")
+        finally:
+            self._destroy_window()
+
+    def _drain_commands(self):
+        with self._command_lock:
+            pending = self._commands
+            self._commands = []
+        for name, data in pending:
+            try:
+                self._command(name, data)
+            except Exception:
+                self.host.logger.exception("custom snow command %s failed", name)
+
+    def _command(self, name, data):
+        if name == "stop":
+            self._stop = True
+            return
+        if name == "config":
+            with self._lock:
+                for key in ("enabled", "mode", "count", "opacity", "speed", "rot"):
+                    if key in data:
+                        self.cfg[key] = data[key]
+                self.cfg["count"] = clamp(int(self.cfg["count"]), 5, 400)
+                self.cfg["opacity"] = clamp(int(self.cfg["opacity"]), 5, 100)
+                self.cfg["speed"] = clamp(float(self.cfg["speed"]), 0.1, 5.0)
+                self.cfg["rot"] = clamp(float(self.cfg["rot"]), 0.0, 5.0)
+            if not self.cfg.get("enabled"):
+                self._particles = []
+            else:
+                self._spawn_all()
+
+    # --------------------------------------------------------------- window
+
+    def _tg_window(self):
+        if not IS_WINDOWS or self._hwnd is None:
+            return None
+        try:
+            pid = int(kernel32.GetCurrentProcessId())
+        except Exception:
+            return None
+        best = [None, 0]
+
+        def callback(hwnd, _lparam):
+            try:
+                if not hwnd or int(hwnd) == int(self._hwnd):
+                    return True
+                if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+                    return True
+                window_pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(window_pid))
+                if int(window_pid.value) != pid:
+                    return True
+                if user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW:
+                    return True
+                rect = wintypes.RECT()
+                if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    return True
+                width = int(rect.right - rect.left)
+                height = int(rect.bottom - rect.top)
+                if width < 320 or height < 240:
+                    return True
+                area = width * height
+                if area > best[1]:
+                    best[0] = hwnd
+                    best[1] = area
+            except Exception:
+                pass
+            return True
+
+        try:
+            user32.EnumWindows(WNDENUMPROC(callback), 0)
+        except Exception:
+            return None
+        return best[0]
+
+    def _frame_rect(self):
+        now = time.monotonic()
+        if now - self._tg_rect_at < 0.25:
+            return self._tg_rect
+        self._tg_rect_at = now
+        hwnd = self._tg_hwnd
+        try:
+            if hwnd and (not user32.IsWindow(hwnd)
+                         or not user32.IsWindowVisible(hwnd)
+                         or user32.IsIconic(hwnd)):
+                hwnd = None
+        except Exception:
+            hwnd = None
+        if hwnd is None:
+            hwnd = self._tg_window()
+            self._tg_hwnd = hwnd
+        self._tg_rect = None
+        if hwnd is None:
+            return None
+        rect = _visible_window_rect(hwnd)
+        if rect is None or rect.right <= rect.left or rect.bottom <= rect.top:
+            return None
+        self._tg_rect = rect
+        return rect
+
+    def _sync_bounds(self):
+        rect = self._frame_rect()
+        enabled = bool(self.cfg.get("enabled"))
+        if rect is None or not enabled:
+            if self._visible:
+                user32.ShowWindow(self._hwnd, SW_HIDE)
+                self._visible = False
+            return
+        width = int(rect.right - rect.left)
+        height = int(rect.bottom - rect.top)
+        if width < 2 or height < 2:
+            return
+        resized = width != self._w or height != self._h
+        moved = rect.left != self._win_x or rect.top != self._win_y
+        if resized:
+            self._w, self._h = width, height
+            self._make_dib()
+            self._resize_particles()
+        if resized or moved:
+            self._win_x = int(rect.left)
+            self._win_y = int(rect.top)
+            if self._visible:
+                user32.SetWindowPos(self._hwnd, None, self._win_x, self._win_y,
+                                    self._w, self._h,
+                                    SWP_NOACTIVATE | SWP_NOOWNERZORDER)
+        if not self._visible:
+            user32.SetWindowPos(self._hwnd, None, self._win_x, self._win_y,
+                                self._w, self._h,
+                                SWP_NOACTIVATE | SWP_NOOWNERZORDER)
+            user32.ShowWindow(self._hwnd, SW_SHOWNOACTIVATE)
+            self._visible = True
+
+    def _create_window(self):
+        instance = kernel32.GetModuleHandleW(None)
+        wc = WNDCLASSEXW()
+        wc.cbSize = ctypes.sizeof(WNDCLASSEXW)
+        wc.lpfnWndProc = self._wndproc
+        wc.hInstance = instance
+        wc.hCursor = user32.LoadCursorW(None, ctypes.c_void_p(IDC_ARROW))
+        wc.lpszClassName = self._class_name
+        self._class_atom = user32.RegisterClassExW(ctypes.byref(wc))
+        if not self._class_atom:
+            raise OSError(ctypes.get_last_error(), "RegisterClassExW failed")
+        self._hwnd = user32.CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE
+            | WS_EX_TRANSPARENT,
+            self._class_name, "CustomSnow", WS_POPUP,
+            0, 0, 8, 8, None, None, instance, None)
+        if not self._hwnd:
+            raise OSError(ctypes.get_last_error(), "CreateWindowExW failed")
+        try:
+            self._scale = clamp(user32.GetDpiForWindow(self._hwnd) / 96.0, 1.0, 3.0)
+        except Exception:
+            self._scale = 1.0
+        self._make_dib()
+        self._spawn_all()
+        self.host.logger.info("Custom Snow overlay created")
+
+    def _destroy_window(self):
+        if self._hwnd is not None:
+            try:
+                user32.DestroyWindow(self._hwnd)
+            except Exception:
+                pass
+            self._hwnd = None
+        if self._class_atom:
+            try:
+                user32.UnregisterClassW(self._class_name,
+                                        kernel32.GetModuleHandleW(None))
+            except Exception:
+                pass
+            self._class_atom = None
+        self._drop_dib()
+        self._visible = False
+
+    def _make_dib(self):
+        self._drop_dib()
+        screen = user32.GetDC(None)
+        try:
+            self._dc = gdi32.CreateCompatibleDC(screen)
+            bmi = BITMAPINFO()
+            bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+            bmi.bmiHeader.biWidth = self._w
+            bmi.bmiHeader.biHeight = -self._h
+            bmi.bmiHeader.biPlanes = 1
+            bmi.bmiHeader.biBitCount = 32
+            bmi.bmiHeader.biCompression = BI_RGB
+            bits = ctypes.c_void_p()
+            self._dib = gdi32.CreateDIBSection(
+                screen, ctypes.byref(bmi), DIB_RGB_COLORS, ctypes.byref(bits), None, 0)
+            if not self._dib:
+                raise OSError(ctypes.get_last_error(), "CreateDIBSection failed")
+            gdi32.SelectObject(self._dc, self._dib)
+            self._bits = bits
+        finally:
+            user32.ReleaseDC(None, screen)
+
+    def _drop_dib(self):
+        if self._dc:
+            gdi32.DeleteDC(self._dc)
+            self._dc = None
+        if self._dib:
+            gdi32.DeleteObject(self._dib)
+            self._dib = None
+        self._bits = None
+
+    def _blit(self):
+        from PIL import Image, ImageChops
+
+        if self._frame is None or not self._bits or not self._dc:
+            return
+        expected = self._w * self._h * 4
+        red, green, blue, alpha = self._frame.split()
+        premultiplied = Image.merge(
+            "RGBA",
+            (ImageChops.multiply(blue, alpha),
+             ImageChops.multiply(green, alpha),
+             ImageChops.multiply(red, alpha),
+             alpha),
+        )
+        data = premultiplied.tobytes()
+        if len(data) != expected:
+            self._make_dib()
+            return
+        try:
+            ctypes.memmove(self._bits, data, len(data))
+        except Exception:
+            self._make_dib()
+            return
+        screen = user32.GetDC(None)
+        try:
+            dst = wintypes.POINT(self._win_x, self._win_y)
+            size = wintypes.SIZE(self._w, self._h)
+            src = wintypes.POINT(0, 0)
+            blend = BLENDFUNCTION(AC_SRC_OVER, 0, 255, AC_SRC_ALPHA)
+            user32.UpdateLayeredWindow(
+                self._hwnd, screen, ctypes.byref(dst), ctypes.byref(size),
+                self._dc, ctypes.byref(src), 0, ctypes.byref(blend), ULW_ALPHA)
+        finally:
+            user32.ReleaseDC(None, screen)
+
+    def _on_message(self, hwnd, msg, wparam, lparam):
+        if msg == WM_MOUSEACTIVATE:
+            return MA_NOACTIVATE
+        if msg in (WM_CLOSE, WM_DESTROY):
+            return 0
+        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    # -------------------------------------------------------------- particles
+
+    def _spawn_all(self):
+        with self._lock:
+            limit = int(self.cfg["count"])
+        needed = limit - len(self._particles)
+        if needed > 0:
+            for _ in range(needed):
+                self._particles.append(self._spawn_one())
+        elif needed < 0:
+            self._particles = self._particles[:limit]
+
+    def _spawn_one(self):
+        mode = int(self.cfg["mode"])
+        w = max(1, self._w)
+        h = max(1, self._h)
+        particle = {
+            "x": self._rng.random() * w,
+            "y": self._rng.random() * h,
+            "size": 3.0 + self._rng.random() * 6.0,
+            "vy": 0.4 + self._rng.random() * 1.6,
+            "angle": self._rng.random() * math.tau,
+            "spin": (self._rng.random() - 0.5) * 4.0,
+            "vx": (self._rng.random() - 0.5) * 0.5,
+            "alpha": self._rng.random(),
+            "hue": self._rng.random(),
+            "glyph": self._rng.choice(MATRIX_GLYPHS),
+            "branch": (self._rng.random() - 0.5) * 90,
+        }
+        if mode == RAIN:
+            particle["size"] = 1.5 + self._rng.random() * 1.5
+            particle["vy"] = 6.0 + self._rng.random() * 10.0
+        elif mode == MATRIX:
+            particle["size"] = 5.0
+            particle["vy"] = 2.0 + self._rng.random() * 3.0
+            particle["y"] = -self._rng.random() * h
+        elif mode in (SAKURA, LEAF):
+            particle["vy"] = 0.5 + self._rng.random() * 1.2
+        return particle
+
+    def _resize_particles(self):
+        with self._lock:
+            if not self._particles:
+                return
+            old_w = old_h = 0
+            self._particles = []
+        self._spawn_all()
+
+    def _render(self, now):
+        from PIL import Image, ImageDraw
+
+        width, height = max(1, self._w), max(1, self._h)
+        if self._frame is None or self._frame.size != (width, height):
+            self._frame = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(self._frame)
+        draw.rectangle([0, 0, width, height], fill=(0, 0, 0, 0))
+
+        with self._lock:
+            cfg = {
+                "mode": int(self.cfg.get("mode", SAKURA)),
+                "opacity": int(self.cfg.get("opacity", 100)),
+                "speed": float(self.cfg.get("speed", 1.0)),
+                "rot": float(self.cfg.get("rot", 1.0)),
+                "count": int(self.cfg.get("count", 100)),
+            }
+        if not self.cfg.get("enabled"):
+            self._blit()
+            return
+        if not self._particles or len(self._particles) < cfg["count"]:
+            self._spawn_all()
+        particles = self._particles
+
+        base = max(40, int(255 * cfg["opacity"] / 100))
+        dt = 1.0 / 60.0
+        mode = cfg["mode"]
+        font_size = max(9, int(round(13 * self._scale)))
+        if mode == MATRIX:
+            font = _load_font(font_size, True)
+        elif mode in (SAKURA, LEAF):
+            font = None
+        else:
+            font = _load_font(font_size)
+
+        for particle in particles:
+            p = particle
+            mode_vy = 1.0
+            if mode == MATRIX:
+                p["vy"] = 2.0 + (0.5 + p["hue"] * 1.5) * cfg["speed"]
+            elif mode == RAIN:
+                mode_vy = 4.0
+            else:
+                mode_vy = 1.0
+            p["y"] += p["vy"] * mode_vy * cfg["speed"] * dt * 60
+            p["x"] += p["vx"] * cfg["speed"] * dt * 60
+            p["angle"] += p["spin"] * cfg["rot"] * dt * 60 * 0.3
+
+            size = p["size"] * self._scale
+            x, y = p["x"], p["y"]
+            alpha = base * (0.5 + 0.5 * p["alpha"])
+            color = self._color(mode, p)
+            fill = color + (int(alpha),)
+
+            if mode == MATRIX:
+                if x < 0 or x > width:
+                    p["x"] = self._rng.random() * width
+                if y >= height + 30:
+                    p["y"] = -20
+                    p["x"] = self._rng.random() * width
+                glyph = p["glyph"]
+                draw.text((x, y), glyph, font=font, fill=fill)
+                continue
+
+            if y >= height + 40:
+                p["y"] = -20
+                p["x"] = self._rng.random() * width
+            if x < -40:
+                p["x"] = width + 30
+            elif x > width + 40:
+                p["x"] = -30
+
+            if mode == RAIN:
+                length = max(3.0, size * 7.0)
+                x1 = x + math.sin(p["angle"]) * length
+                y1 = y + length
+                draw.line([x, y, x1, y1], fill=fill, width=max(1, int(size)))
+                continue
+            if mode == LEAF:
+                bx = x + math.cos(p["angle"]) * size * 0.8
+                by = y + math.sin(p["angle"]) * size * 0.8
+                draw.ellipse([x - size, y - size / 2, x + size, y + size / 2],
+                             fill=fill)
+                draw.ellipse([bx - size / 2, by - size / 2,
+                              bx + size / 2, by + size / 2],
+                             fill=color + (int(alpha * 0.7),))
+                draw.line([x, y, bx, by], fill=color + (int(alpha * 0.8),),
+                          width=max(1, int(size / 2)))
+                continue
+            if mode == SAKURA:
+                draw.ellipse([x - size, y - size, x + size, y + size], fill=fill)
+                draw.ellipse([x - size * 0.4, y - size * 0.4,
+                              x + size * 0.4, y + size * 0.4],
+                             fill=color + (int(alpha * 0.6),))
+                continue
+            # Снежинка: шесть лучей
+            lines = 6
+            for i in range(lines):
+                angle = p["angle"] + i * math.tau / lines
+                tip_x = x + math.cos(angle) * size
+                tip_y = y + math.sin(angle) * size
+                draw.line([x, y, tip_x, tip_y], fill=fill, width=max(1, int(size * 0.35)))
+
+    def _color(self, mode, particle):
+        if mode == MATRIX:
+            intensity = 120 + int(120 * particle["alpha"])
+            return (140, 255, intensity)
+        if mode == RAIN:
+            return (190, 205, 235)
+        if mode == SAKURA:
+            return (255, 183, 197)
+        if mode == LEAF:
+            colors = ((200, 110, 40), (230, 160, 50), (160, 90, 40), (110, 80, 60))
+            return colors[int(particle["hue"] * len(colors)) % len(colors)]
+        return (255, 255, 255)
+
+
+_SNOW_OVERLAY_SRC = r'''import json
+import math
+import os
+import random
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+from PyQt6.QtCore import QObject, QPoint, QPointF, QRectF, QTimer, Qt, pyqtClassInfo, pyqtSignal, pyqtSlot
+from PyQt6.QtDBus import QDBusConnection, QDBusInterface, QDBusMessage
+from PyQt6.QtGui import (QColor, QFont, QFontMetricsF, QGuiApplication, QPainter, QPainterPath,
+                         QPen, QPixmap)
+from PyQt6.QtWidgets import QApplication, QWidget
+
+IN = sys.stdin.buffer
+OUT = sys.stdout.buffer
+_out_lock = threading.Lock()
+
+FX, SAKURA, MATRIX, RAIN, LEAF = 0, 1, 2, 3, 4
+MATRIX_GLYPHS = "アイウエオカキクケコ0123456789ABCDEF"
+LEAF_COLORS = ((200, 110, 40), (230, 160, 50), (160, 90, 40), (110, 80, 60))
+
+
+def send(kind, payload=None):
+    data = json.dumps(payload or {}).encode("utf-8")
+    with _out_lock:
+        OUT.write(kind + struct.pack("<I", len(data)) + data)
+        OUT.flush()
+
+
+def read_exact(size):
+    buf = b""
+    while len(buf) < size:
+        chunk = IN.read(size - len(buf))
+        if not chunk:
+            raise EOFError()
+        buf += chunk
+    return buf
+
+
+SCRIPT_NAME = "custom_snow_overlay"
+
+KWIN_SCRIPT = r"""
+var TG_PID = __TG_PID__;
+var SELF_PID = __SELF_PID__;
+var SERVICE = "__SERVICE__";
+
+function onThisDesktop(w) {
+    if (w.onAllDesktops) return true;
+    var cur = workspace.currentDesktop;
+    for (var i = 0; i < w.desktops.length; i++) {
+        if (w.desktops[i] === cur || w.desktops[i].id === cur.id) return true;
+    }
+    return false;
+}
+
+function report() {
+    var list = workspace.windowList();
+    var best = null, area = 0, active = false;
+    for (var i = 0; i < list.length; i++) {
+        var w = list[i];
+        if (w.pid !== TG_PID) continue;
+        if (w.active) active = true;
+        if (!w.normalWindow || w.minimized || !onThisDesktop(w)) continue;
+        var g = w.frameGeometry;
+        if (g.width * g.height > area) { area = g.width * g.height; best = g; }
+    }
+    var msg = best
+        ? {found: true, x: Math.round(best.x), y: Math.round(best.y),
+           w: Math.round(best.width), h: Math.round(best.height), active: active}
+        : {found: false, active: active};
+    callDBus(SERVICE, "/geom", "org.customsnow.Geom", "update", JSON.stringify(msg));
+}
+
+function style(w) {
+    w.keepAbove = true;
+    w.skipTaskbar = true;
+    w.skipPager = true;
+    w.skipSwitcher = true;
+    w.noBorder = true;
+}
+
+function hook(w) {
+    if (w.pid === SELF_PID) { style(w); return; }
+    if (w.pid !== TG_PID) return;
+    w.frameGeometryChanged.connect(report);
+    w.minimizedChanged.connect(report);
+    w.activeChanged.connect(report);
+    w.desktopsChanged.connect(report);
+}
+
+workspace.windowAdded.connect(function (w) { hook(w); report(); });
+workspace.windowRemoved.connect(report);
+workspace.windowActivated.connect(report);
+workspace.currentDesktopChanged.connect(report);
+var existing = workspace.windowList();
+for (var k = 0; k < existing.length; k++) hook(existing[k]);
+report();
+"""
+
+
+@pyqtClassInfo("D-Bus Interface", "org.customsnow.Geom")
+class Geom(QObject):
+    def __init__(self):
+        QObject.__init__(self)
+        self.window = None
+
+    @pyqtSlot(str)
+    def update(self, text):
+        try:
+            if self.window is not None:
+                self.window.on_geometry(json.loads(text))
+        except Exception:
+            pass
+
+
+class KWinLink:
+    def __init__(self, window):
+        self.geom = Geom()
+        self.geom.window = window
+        self.iface = None
+        self.service = "org.customsnow.p%d" % os.getpid()
+
+    def start(self, tg_pid):
+        bus = QDBusConnection.sessionBus()
+        if not bus.isConnected():
+            return False, "no session bus"
+        if not bus.registerService(self.service):
+            return False, "cannot register " + self.service
+        if not bus.registerObject("/geom", self.geom,
+                                  QDBusConnection.RegisterOption.ExportAllSlots):
+            return False, "cannot register object"
+        iface = QDBusInterface("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", bus)
+        if not iface.isValid():
+            return False, "KWin scripting is not available"
+        self.iface = iface
+        code = (KWIN_SCRIPT.replace("__TG_PID__", str(int(tg_pid)))
+                .replace("__SELF_PID__", str(os.getpid()))
+                .replace("__SERVICE__", self.service))
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "snow_kwin.js")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(code)
+        iface.call("unloadScript", SCRIPT_NAME)
+        reply = iface.call("loadScript", path, SCRIPT_NAME)
+        if reply.type() == QDBusMessage.MessageType.ErrorMessage:
+            return False, reply.errorMessage()
+        iface.call("start")
+        return True, ""
+
+    def stop(self):
+        try:
+            if self.iface is not None:
+                self.iface.call("unloadScript", SCRIPT_NAME)
+        except Exception:
+            pass
+
+
+def output_rates():
+    """Real refresh rate of every enabled output, keyed by its position."""
+    try:
+        env = {k: v for k, v in os.environ.items() if k != "QT_QPA_PLATFORM"}
+        out = subprocess.run(["kscreen-doctor", "-j"], capture_output=True,
+                             timeout=6, text=True, env=env).stdout
+        data = json.loads(out)
+    except Exception:
+        return {}
+    rates = {}
+    for output in data.get("outputs", []):
+        if not output.get("enabled"):
+            continue
+        mode = None
+        for item in output.get("modes", []):
+            if item.get("id") == output.get("currentModeId"):
+                mode = item
+        pos = output.get("pos") or {}
+        if mode and "refreshRate" in mode:
+            rates[(int(pos.get("x", 0)), int(pos.get("y", 0)))] = float(mode["refreshRate"])
+    return rates
+
+
+class Bridge(QObject):
+    message = pyqtSignal(bytes, bytes)
+    rates_ready = pyqtSignal(object)
+
+
+def reader(bridge):
+    try:
+        while True:
+            head = read_exact(5)
+            size = struct.unpack("<I", head[1:])[0]
+            body = read_exact(size) if size else b""
+            bridge.message.emit(head[:1], body)
+    except Exception:
+        bridge.message.emit(b"X", b"")
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+class Field:
+    """Particle simulation and drawing. Same particle types as the Windows
+    plugin, but rotation is per *second* (the original turned per frame, which
+    looked frantic), rain falls along its path, flakes have branches and leaves
+    look like leaves. Shapes are pre-rendered once and only rotated per frame."""
+
+    # radians per second per unit of "spin" (spin is in -2..2)
+    ROT_BASE = {FX: 0.5, SAKURA: 0.6, LEAF: 1.1}
+
+    def __init__(self):
+        self.cfg = {"enabled": True, "mode": SAKURA, "count": 100, "opacity": 100,
+                    "speed": 1.0, "rot": 1.0, "size": 1.0}
+        self.rng = random.Random(20240101)
+        self.particles = []
+        self.w = 1
+        self.h = 1
+        self.scale = 1.0
+        self.sprites = {}
+
+    # ---- spawning
+    def spawn_one(self):
+        mode = int(self.cfg["mode"])
+        w = max(1, self.w)
+        h = max(1, self.h)
+        r = self.rng.random
+        p = {
+            "x": r() * w, "y": r() * h, "size": 3.0 + r() * 6.0,
+            "vy": 0.4 + r() * 1.6, "angle": r() * math.tau,
+            "spin": (r() - 0.5) * 4.0, "vx": (r() - 0.5) * 0.5,
+            "alpha": r(), "hue": r(), "glyph": self.rng.choice(MATRIX_GLYPHS),
+            "phase": r() * math.tau, "tilt": 0.0,
+        }
+        if mode == RAIN:
+            p["size"] = 1.5 + r() * 1.5
+            p["vy"] = 6.0 + r() * 10.0
+            # the drop moves along (vx, vy*4); draw it along that direction
+            p["tilt"] = math.degrees(math.atan2(-p["vx"], p["vy"] * 4.0))
+        elif mode == MATRIX:
+            p["size"] = 5.0
+            p["vy"] = 2.0 + r() * 3.0
+            p["y"] = -r() * h
+        elif mode in (SAKURA, LEAF):
+            p["vy"] = 0.5 + r() * 1.2
+        return p
+
+    def respawn(self):
+        self.particles = []
+        self.fill()
+
+    def fill(self):
+        limit = int(self.cfg["count"])
+        while len(self.particles) < limit:
+            self.particles.append(self.spawn_one())
+        del self.particles[limit:]
+
+    def configure(self, cfg):
+        old_mode = self.cfg["mode"]
+        self.cfg.update(cfg)
+        self.cfg["mode"] = clamp(int(self.cfg["mode"]), 0, 4)
+        self.cfg["size"] = clamp(float(self.cfg.get("size", 1.0)), 0.2, 6.0)
+        if self.cfg["mode"] != old_mode:
+            self.respawn()
+        else:
+            self.fill()
+
+    def resize(self, w, h):
+        if (w, h) != (self.w, self.h):
+            self.w, self.h = max(1, w), max(1, h)
+            self.respawn()
+
+    # ---- physics
+    def step(self, dt):
+        mode = int(self.cfg["mode"])
+        speed = float(self.cfg["speed"])
+        rot = float(self.cfg["rot"])
+        k = dt * 60.0                      # movement is tuned for 60 fps
+        omega = self.ROT_BASE.get(mode, 0.0) * rot
+        w, h = self.w, self.h
+        r = self.rng.random
+        sway = mode in (FX, SAKURA, LEAF)
+        for p in self.particles:
+            mode_vy = 1.0
+            if mode == MATRIX:
+                p["vy"] = 2.0 + (0.5 + p["hue"] * 1.5) * speed
+            elif mode == RAIN:
+                mode_vy = 4.0
+            p["y"] += p["vy"] * mode_vy * speed * k
+            p["x"] += p["vx"] * speed * k
+            if sway:
+                p["phase"] += dt * (1.0 + p["hue"])
+                p["x"] += math.sin(p["phase"]) * 0.35 * speed * k
+                p["angle"] += p["spin"] * omega * dt
+            if mode == MATRIX:
+                if p["x"] < 0 or p["x"] > w:
+                    p["x"] = r() * w
+                if p["y"] >= h + 30:
+                    p["y"] = -20
+                    p["x"] = r() * w
+                continue
+            if p["y"] >= h + 40:
+                p["y"] = -20
+                p["x"] = r() * w
+            if p["x"] < -40:
+                p["x"] = w + 30
+            elif p["x"] > w + 40:
+                p["x"] = -30
+
+    # ---- sprites (drawn once, then only transformed)
+    @staticmethod
+    def _canvas(extent):
+        n = int(math.ceil(extent * 2)) + 4
+        pixmap = QPixmap(n, n)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.translate(n / 2.0, n / 2.0)
+        return pixmap, painter, n / 2.0
+
+    def _flake(self, s, rot):
+        pixmap, painter, half = self._canvas(s * 1.2)
+        painter.rotate(rot)
+        main = QPen(QColor(255, 255, 255), max(1.0, s * 0.26),
+                    Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        thin = QPen(QColor(255, 255, 255), max(1.0, s * 0.18),
+                    Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        c60, s60 = math.cos(math.radians(60)), math.sin(math.radians(60))
+        for i in range(6):
+            painter.save()
+            painter.rotate(i * 60)
+            painter.setPen(main)
+            painter.drawLine(QPointF(0, 0), QPointF(s, 0))
+            painter.setPen(thin)
+            bx, bl = s * 0.55, s * 0.4
+            painter.drawLine(QPointF(bx, 0), QPointF(bx + bl * c60, bl * s60))
+            painter.drawLine(QPointF(bx, 0), QPointF(bx + bl * c60, -bl * s60))
+            painter.restore()
+        painter.end()
+        return pixmap, half
+
+    def _leaf(self, s, rgb, rot):
+        length, width = s * 2.8, s * 1.15
+        pixmap, painter, half = self._canvas(length * 0.75)
+        painter.rotate(rot)
+        body = QColor(*rgb)
+        dark = QColor(int(rgb[0] * 0.6), int(rgb[1] * 0.55), int(rgb[2] * 0.5))
+        path = QPainterPath()
+        path.moveTo(-length / 2, 0)
+        path.cubicTo(-length / 4, -width * 1.15, length / 4, -width * 1.15, length / 2, 0)
+        path.cubicTo(length / 4, width * 1.15, -length / 4, width * 1.15, -length / 2, 0)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(body)
+        painter.drawPath(path)
+        vein = QPen(dark, max(1.0, s * 0.16), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        painter.setPen(vein)
+        painter.drawLine(QPointF(-length / 2 - length * 0.16, 0), QPointF(length * 0.42, 0))
+        for t in (-0.22, 0.02, 0.24):
+            x0 = length * t
+            painter.drawLine(QPointF(x0, 0), QPointF(x0 + length * 0.17, -width * 0.7))
+            painter.drawLine(QPointF(x0, 0), QPointF(x0 + length * 0.17, width * 0.7))
+        painter.end()
+        return pixmap, half
+
+    def _sakura(self, s):
+        pixmap, painter, half = self._canvas(s)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(255, 183, 197))
+        painter.drawEllipse(QRectF(-s, -s, s * 2, s * 2))
+        painter.setBrush(QColor(255, 140, 165))
+        painter.drawEllipse(QRectF(-s * 0.4, -s * 0.4, s * 0.8, s * 0.8))
+        painter.end()
+        return pixmap, half
+
+    def _drop(self, w, length, tilt):
+        pixmap, painter, half = self._canvas(length)
+        painter.rotate(tilt)
+        painter.setPen(QPen(QColor(190, 205, 235), max(1.0, w), Qt.PenStyle.SolidLine,
+                            Qt.PenCapStyle.RoundCap))
+        painter.drawLine(QPointF(0, 0), QPointF(0, -length))        # head at the origin
+        painter.end()
+        return pixmap, half
+
+    def _glyph(self, glyph, level, px):
+        font = QFont()
+        font.setPixelSize(px)
+        font.setBold(True)
+        metrics = QFontMetricsF(font)
+        n = int(math.ceil(max(metrics.horizontalAdvance(glyph), metrics.height()))) + 4
+        pixmap = QPixmap(n, n)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setFont(font)
+        painter.setPen(QColor(140, 255, 120 + level * 40))
+        painter.drawText(QPointF(2, 2 + metrics.ascent()), glyph)
+        painter.end()
+        return pixmap, 0.0
+
+    def sprite(self, key, build):
+        entry = self.sprites.get(key)
+        if entry is None:
+            if len(self.sprites) > 4000:
+                self.sprites.clear()
+            entry = self.sprites[key] = build()
+        return entry
+
+    # ---- drawing
+    FLAKE_STEP = 6      # degrees; a snowflake repeats every 60 degrees
+    LEAF_STEP = 8
+
+    def draw(self, painter):
+        mode = int(self.cfg["mode"])
+        base = max(40, int(255 * int(self.cfg["opacity"]) / 100)) / 255.0
+        mul = self.scale * float(self.cfg["size"])
+        pt = QPointF
+        for p in self.particles:
+            size = round(p["size"] * mul * 2.0) / 2.0          # bucket -> few sprites
+            if size < 1.0:
+                size = 1.0
+            painter.setOpacity(base * (0.5 + 0.5 * p["alpha"]))
+            if mode == MATRIX:
+                level = min(3, int(p["alpha"] * 4))
+                px = max(9, int(round(13 * mul)))
+                pixmap, _ = self.sprite(("m", p["glyph"], level, px),
+                                        lambda g=p["glyph"], l=level, f=px: self._glyph(g, l, f))
+                painter.drawPixmap(pt(p["x"] - 2, p["y"] - 2), pixmap)
+                continue
+            if mode == RAIN:
+                length = max(3.0, size * 7.0)
+                pixmap, half = self.sprite(("r", size, int(round(p["tilt"]))),
+                                           lambda s=size, n=length, t=p["tilt"]: self._drop(max(1.0, int(s)), n, t))
+            elif mode == LEAF:
+                idx = int(p["hue"] * len(LEAF_COLORS)) % len(LEAF_COLORS)
+                step = int(round(math.degrees(p["angle"]) / self.LEAF_STEP)) % (360 // self.LEAF_STEP)
+                pixmap, half = self.sprite(
+                    ("l", size, idx, step),
+                    lambda s=size, c=LEAF_COLORS[idx], t=step: self._leaf(s, c, t * self.LEAF_STEP))
+            elif mode == SAKURA:
+                pixmap, half = self.sprite(("s", size), lambda s=size: self._sakura(s))
+            else:
+                step = int(round(math.degrees(p["angle"]) / self.FLAKE_STEP)) % (60 // self.FLAKE_STEP)
+                pixmap, half = self.sprite(
+                    ("f", size, step), lambda s=size, t=step: self._flake(s, t * self.FLAKE_STEP))
+            painter.drawPixmap(pt(p["x"] - half, p["y"] - half), pixmap)
+        painter.setOpacity(1.0)
+
+
+class SnowWindow(QWidget):
+    def __init__(self, field):
+        flags = (Qt.WindowType.FramelessWindowHint
+                 | Qt.WindowType.WindowStaysOnTopHint
+                 | Qt.WindowType.Tool
+                 | Qt.WindowType.WindowDoesNotAcceptFocus
+                 | Qt.WindowType.WindowTransparentForInput)
+        super().__init__(None, flags)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_X11DoNotAcceptFocus, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAutoFillBackground(False)
+        self.setWindowTitle("Custom Snow")
+        self.field = field
+        self.geo = None
+        self.rates = {}
+        self.interval_ms = 16
+        self.last = time.monotonic()
+        self.frames = 0
+        self.timer = QTimer(self)
+        self.timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self.timer.timeout.connect(self.tick)
+
+    # ---- state
+    def on_geometry(self, data):
+        self.geo = data
+        self.refresh()
+
+    def set_rates(self, rates):
+        self.rates = rates
+        self.refresh()
+
+    def refresh_rate(self):
+        geo = self.geo or {}
+        if geo.get("found"):
+            screen = QGuiApplication.screenAt(
+                QPoint(geo["x"] + geo["w"] // 2, geo["y"] + geo["h"] // 2))
+            if screen is not None:
+                g = screen.geometry()
+                rate = self.rates.get((g.x(), g.y())) or screen.refreshRate()
+                return clamp(float(rate or 60.0), 30.0, 360.0)
+        return 60.0
+
+    def refresh(self):
+        geo = self.geo or {}
+        want = (bool(self.field.cfg.get("enabled")) and bool(geo.get("found"))
+                and bool(geo.get("active")))
+        if want:
+            self.field.scale = 1.0
+            self.field.resize(int(geo["w"]), int(geo["h"]))
+            rect = (int(geo["x"]), int(geo["y"]), int(geo["w"]), int(geo["h"]))
+            if (self.x(), self.y(), self.width(), self.height()) != rect:
+                self.setGeometry(*rect)
+            interval = max(1, int(round(1000.0 / self.refresh_rate())))
+            if interval != self.interval_ms or not self.timer.isActive():
+                self.interval_ms = interval
+                self.timer.start(interval)
+            if not self.isVisible():
+                self.last = time.monotonic()
+                self.show()
+        elif self.isVisible():
+            self.timer.stop()
+            self.hide()
+
+    def tick(self):
+        now = time.monotonic()
+        dt = clamp(now - self.last, 0.0, 0.05)
+        self.last = now
+        self.frames += 1
+        self.field.step(dt)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 0))
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        self.field.draw(painter)
+        painter.end()
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+    field = Field()
+    window = SnowWindow(field)
+    bridge = Bridge()
+    link = KWinLink(window)
+
+    def handle(kind, body):
+        if kind == b"C":
+            field.configure(json.loads(body.decode("utf-8")))
+            window.refresh()
+        elif kind == b"K":
+            data = json.loads(body.decode("utf-8"))
+            try:
+                ok, error = link.start(int(data.get("tg_pid", 0)))
+            except Exception as exc:
+                ok, error = False, str(exc)
+            send(b"K", {"ok": ok, "error": error})
+        elif kind == b"X":
+            link.stop()
+            app.quit()
+
+    def fetch_rates():
+        threading.Thread(target=lambda: bridge.rates_ready.emit(output_rates()),
+                         daemon=True).start()
+
+    bridge.message.connect(handle)
+    bridge.rates_ready.connect(window.set_rates)
+    threading.Thread(target=reader, args=(bridge,), daemon=True).start()
+    fetch_rates()
+    slow = QTimer()
+    slow.timeout.connect(fetch_rates)
+    slow.start(20000)
+    test = os.environ.get("SNOW_TEST_GEOM")
+    if test:
+        x, y, w, h = [int(v) for v in test.split(",")]
+        window.on_geometry({"found": True, "active": True, "x": x, "y": y, "w": w, "h": h})
+    send(b"S", {"ready": True})
+    code = app.exec()
+    try:
+        OUT.flush()
+    except Exception:
+        pass
+    os._exit(code)
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+# =====================================================================
+#  Linux: PyQt6 overlay in a separate process (KDE / KWin)
+# =====================================================================
+
+class SnowOverlayLinux:
+    """Runs snow_overlay.py with the system Python (PyQt6). The helper draws
+    the particles itself on a click-through window that follows the exDesktop
+    window (position comes from a KWin script); the plugin only sends settings.
+    """
+
+    def __init__(self, host):
+        self.host = host
+        self._proc = None
+        self._thread = None
+        self._cfg = None
+        self._stopping = False
+        self._write_lock = threading.Lock()
+
+    @staticmethod
+    def _env():
+        env = dict(os.environ)
+        for key in list(env):
+            if key.startswith("QT_") or key in (
+                    "PYTHONHOME", "PYTHONPATH", "LD_LIBRARY_PATH", "LD_PRELOAD"):
+                env.pop(key, None)
+        env["QT_QPA_PLATFORM"] = os.environ.get("SNOW_QT_PLATFORM") or "xcb"
+        env["PYTHONUNBUFFERED"] = "1"
+        return env
+
+    def _find_python(self):
+        env = self._env()
+        seen = set()
+        for name in ("/usr/bin/python3", shutil.which("python3"), shutil.which("python")):
+            if not name or name in seen or not os.path.exists(name):
+                continue
+            seen.add(name)
+            try:
+                result = subprocess.run(
+                    [name, "-c", "import PyQt6.QtWidgets, PyQt6.QtGui, PyQt6.QtDBus"],
+                    env=env, capture_output=True, timeout=20)
+            except Exception:
+                continue
+            if result.returncode == 0:
+                return name
+        return None
+
+    def _write_script(self):
+        directory = os.path.join(get_plugins_dir(), "custom_snow_data")
+        ensure_dir_exists(directory)
+        path = os.path.join(directory, "snow_overlay.py")
+        try:
+            with open(path, encoding="utf-8") as handle:
+                if handle.read() == _SNOW_OVERLAY_SRC:
+                    return path
+        except OSError:
+            pass
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(_SNOW_OVERLAY_SRC)
+        return path
+
+    def _send(self, kind, obj=None):
+        proc = self._proc
+        if proc is None or proc.stdin is None:
+            return False
+        payload = json.dumps(obj or {}).encode("utf-8")
+        try:
+            with self._write_lock:
+                proc.stdin.write(kind + struct.pack("<I", len(payload)) + payload)
+                proc.stdin.flush()
+            return True
+        except Exception:
+            return False
+
+    def _read_stdout(self, proc):
+        try:
+            while True:
+                head = proc.stdout.read(5)
+                if len(head) < 5:
+                    break
+                size = struct.unpack("<I", head[1:])[0]
+                body = proc.stdout.read(size) if size else b""
+                if head[:1] == b"K":
+                    try:
+                        data = json.loads(body.decode("utf-8"))
+                    except Exception:
+                        continue
+                    if data.get("ok"):
+                        self.host.logger.info("Custom Snow follows the exDesktop window (KWin)")
+                    else:
+                        self.host.logger.warning(
+                            "Custom Snow cannot follow the window: %s", data.get("error"))
+        except Exception:
+            pass
+
+    def _read_stderr(self, proc):
+        try:
+            for line in proc.stderr:
+                text = line.decode("utf-8", "replace").rstrip()
+                if text:
+                    self.host.logger.warning("snow overlay: %s", text)
+        except Exception:
+            pass
+
+    # ---- public API (same as the Windows overlay)
+
+    def start(self):
+        if self._thread is not None:
+            return
+        self._stopping = False
+        self._thread = threading.Thread(target=self._boot, name="custom-snow", daemon=True)
+        self._thread.start()
+
+    def _boot(self):
+        log = self.host.logger
+        try:
+            python = self._find_python()
+            if python is None:
+                log.warning("Custom Snow needs the system Python with PyQt6 "
+                            "(Arch: sudo pacman -S python-pyqt6)")
+                return
+            script = self._write_script()
+            proc = subprocess.Popen(
+                [python, script], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, env=self._env(), bufsize=0, close_fds=True)
+        except Exception:
+            log.exception("cannot start Custom Snow overlay")
+            return
+        if self._stopping:
+            proc.kill()
+            return
+        self._proc = proc
+        threading.Thread(target=self._read_stdout, args=(proc,), daemon=True).start()
+        threading.Thread(target=self._read_stderr, args=(proc,), daemon=True).start()
+        log.info("Custom Snow overlay started (pid %s)", proc.pid)
+        self._send(b"K", {"tg_pid": os.getpid()})
+        if self._cfg is not None:
+            self._send(b"C", self._cfg)
+
+    def set_config(self, config):
+        self._cfg = dict(config)
+        self._send(b"C", self._cfg)
+
+    def command(self, name, data=None):
+        return
+
+    def stop(self):
+        self._stopping = True
+        proc = self._proc
+        self._proc = None
+        if proc is not None:
+            try:
+                proc.stdin.write(b"X" + struct.pack("<I", 0))
+                proc.stdin.flush()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=2.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        thread = self._thread
+        self._thread = None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=3.0)
+
+
+class CustomSnowPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._overlay = None
+        self._cfg = {
+            "size": 1.0,
+            "enabled": True,
+            "mode": SAKURA,
+            "count": 100,
+            "opacity": 100,
+            "speed": 1.0,
+            "rot": 1.0,
+        }
+
+    def on_plugin_load(self):
+        self._reload_config()
+        if IS_WINDOWS:
+            self._overlay = SnowOverlay(self)
+            self._overlay.start()
+            self._overlay.set_config(self._cfg)
+        elif IS_LINUX:
+            self._overlay = SnowOverlayLinux(self)
+            self._overlay.start()
+            self._overlay.set_config(self._cfg)
+        else:
+            self.log("Custom Snow overlay is only available on Windows and Linux")
+        self.log("Custom Snow loaded for exDesktop")
+
+    def on_plugin_unload(self):
+        if self._overlay is not None:
+            self._overlay.stop()
+            self._overlay = None
+
+    # ------------------------------------------------------------ settings
+
+    def _reload_config(self):
+        self._cfg["enabled"] = bool(self.get_setting("always_enable", True))
+        mode_index = clamp(int(self.get_setting("particle_mode", 1)), 0, 4)
+        self._cfg["mode"] = mode_index
+        count_index = clamp(int(self.get_setting("particle_count", 4)), 0,
+                            len(PARTICLE_COUNTS) - 1)
+        self._cfg["count"] = PARTICLE_COUNTS[count_index]
+        alpha_index = clamp(int(self.get_setting("particle_alpha", 9)), 0,
+                            len(OPACITY_VALUES) - 1)
+        self._cfg["opacity"] = OPACITY_VALUES[alpha_index]
+        self._cfg["speed"] = parse_float(SPEED_VALUES[clamp(
+            int(self.get_setting("particle_speed", SPEED_DEFAULT)), 0, len(SPEED_VALUES) - 1)], 1.0)
+        self._cfg["rot"] = parse_float(SPEED_VALUES[clamp(
+            int(self.get_setting("rotation_speed", SPEED_DEFAULT)), 0, len(SPEED_VALUES) - 1)], 1.0)
+        self._cfg["size"] = parse_float(SIZE_VALUES[clamp(
+            int(self.get_setting("particle_size", 2)), 0, len(SIZE_VALUES) - 1)], 1.0)
+
+    def _push(self):
+        if self._overlay is None:
+            return
+        self._overlay.set_config(self._cfg)
+
+    def create_settings(self):
+        modes = tr("Снежинки, Сакура, Матрица, Дождик, Осенний листопад",
+                   "Snowflakes, Sakura, Matrix, Rain, Autumn Leaves").split(", ")
+        return [
+            Header(text=tr("Пользовательский снег", "Custom Snow")),
+            Switch(
+                key="always_enable",
+                text=tr("Включить частицы", "Enable particles"),
+                default=self.get_setting("always_enable", True),
+                on_change=self._on_enabled,
+            ),
+            Divider(),
+            Selector(
+                key="particle_mode",
+                text=tr("Вид частиц", "Particle type"),
+                items=modes,
+                default=clamp(int(self.get_setting("particle_mode", 1)), 0, 4),
+                on_change=self._on_mode,
+            ),
+            Header(text=tr("Настройка частиц", "Particle Settings")),
+            Selector(
+                key="particle_count",
+                text=tr("Количество частиц", "Particle count"),
+                items=["%d" % value for value in PARTICLE_COUNTS],
+                default=clamp(int(self.get_setting("particle_count", 4)), 0,
+                              len(PARTICLE_COUNTS) - 1),
+                on_change=self._on_count,
+            ),
+            *([Selector(
+                key="particle_size",
+                text=tr("Размер частиц", "Particle size"),
+                items=["%sx" % value for value in SIZE_VALUES],
+                default=clamp(int(self.get_setting("particle_size", 2)), 0,
+                              len(SIZE_VALUES) - 1),
+                on_change=self._on_size,
+            )] if IS_LINUX else []),
+            Selector(
+                key="particle_alpha",
+                text=tr("Прозрачность частиц", "Particle opacity"),
+                items=["%d%%" % value for value in OPACITY_VALUES],
+                default=clamp(int(self.get_setting("particle_alpha", 9)), 0,
+                              len(OPACITY_VALUES) - 1),
+                on_change=self._on_alpha,
+            ),
+            Selector(
+                key="particle_speed",
+                text=tr("Скорость падения частиц", "Fall speed"),
+                items=["%sx" % value for value in SPEED_VALUES],
+                default=clamp(int(self.get_setting("particle_speed", SPEED_DEFAULT)), 0,
+                              len(SPEED_VALUES) - 1),
+                on_change=self._on_speed,
+            ),
+            Selector(
+                key="rotation_speed",
+                text=tr("Скорость вращения", "Rotation speed"),
+                items=["%sx" % value for value in SPEED_VALUES],
+                default=clamp(int(self.get_setting("rotation_speed", SPEED_DEFAULT)), 0,
+                              len(SPEED_VALUES) - 1),
+                on_change=self._on_rot,
+            ),
+            Divider(),
+            Text(
+                text="@mraniv & @anivplugins",
+                subtext=tr("автор, нажмите чтобы подписаться", "author, tap to subscribe"),
+                icon="msg_info",
+                on_click=self._open_author_channel,
+            ),
+            Divider(
+                text=tr(
+                    "Частицы рисуются прозрачным окном поверх чата; клики по ним "
+                    "проходят сквозь. Не работает в полноэкранных видео/плеере.",
+                    "Particles are drawn by a transparent overlay above the chat; "
+                    "clicks pass through. Not shown over fullscreen video/player.",
+                )
+            ),
+        ]
+
+    def _on_enabled(self, value):
+        self._cfg["enabled"] = bool(value)
+        self._push()
+
+    def _on_mode(self, value):
+        self._cfg["mode"] = clamp(int(value), 0, 4)
+        self._push()
+
+    def _on_count(self, value):
+        self._cfg["count"] = PARTICLE_COUNTS[clamp(
+            int(value), 0, len(PARTICLE_COUNTS) - 1)]
+        self._push()
+
+    def _on_alpha(self, value):
+        self._cfg["opacity"] = OPACITY_VALUES[clamp(
+            int(value), 0, len(OPACITY_VALUES) - 1)]
+        self._push()
+
+    def _on_size(self, value):
+        self._cfg["size"] = parse_float(SIZE_VALUES[clamp(
+            int(value), 0, len(SIZE_VALUES) - 1)], 1.0)
+        self._push()
+
+    def _on_speed(self, value):
+        self._cfg["speed"] = parse_float(SPEED_VALUES[clamp(
+            int(value), 0, len(SPEED_VALUES) - 1)], 1.0)
+        self._push()
+
+    def _on_rot(self, value):
+        self._cfg["rot"] = parse_float(SPEED_VALUES[clamp(
+            int(value), 0, len(SPEED_VALUES) - 1)], 1.0)
+        self._push()
+
+    def _open_author_channel(self, view=None):
+        try:
+            import _extera
+
+            _extera.open_url("https://t.me/anivplugins")
+        except Exception:
+            pass
